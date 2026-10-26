@@ -1,0 +1,285 @@
+/*
+ * PONG MECÁNICO - MÁQUINA ARCADE
+ * Autor: Alberto Nicas (@Altenife) - Julio 2025
+ * Versión: 1.0
+ * 
+ * Sistema de control para Pong mecánico con Arduino
+ * Hardware: 2x DRV8871, 4x KY-003, 2x motores DC
+ * Funciones: Control bidireccional, 3 velocidades, pausa automática
+ * 
+ * Licencia: Creative Commons No-Comercial  CC BY-NC-SA 4.0 (Reconocimiento-NoComercial)
+ * 
+ * Puedes usar, modificar y compartir este código y los diseños 3D
+ * siempre que menciones al autor original y no realices ningún uso comercial.
+ * Más información: https://creativecommons.org/licenses/by-nc/4.0/
+ */
+
+
+
+// Pines del motor principal DRV8871
+const int IN1_PIN = 3;  // PWM
+const int IN2_PIN = 5;  // PWM
+
+// Pines del segundo motor DRV8871
+const int IN1_PIN_2 = 10;  // PWM
+const int IN2_PIN_2 = 11;  // PWM
+
+// Pines de los sensores magnéticos KY-003 (cambio de dirección)
+const int SENSOR_LEFT = 2;   // Extremo izquierdo
+const int SENSOR_RIGHT = 12; // Extremo derecho
+
+// Pines de los sensores de final de carrera KY-003
+const int END_STOP_LEFT = 7;   // Final de carrera izquierdo
+const int END_STOP_RIGHT = 8;  // Final de carrera derecho
+
+// Pin del interruptor de velocidad
+const int SPEED_BUTTON_PIN = 6;
+
+// Niveles de velocidad (PWM)
+const int SPEED_LEVELS[3] = {90, 100, 115}; // 30%, medio, 45%
+int speedLevel = 0; // Comienza en 30%
+int MAX_SPEED = SPEED_LEVELS[speedLevel];
+
+// Configuración del motor
+const int BRAKE_TIME = 20;   // Tiempo de frenado gradual en ms
+const int BRAKE_STEPS = 5;   // Pasos para el frenado gradual
+
+// Variables de estado
+int currentSpeed = 0;
+int targetSpeed = 0;
+bool motorDirection = true;   // true = derecha, false = izquierda
+bool pendingDirectionChange = false;
+bool newDirection = true;
+unsigned long lastUpdate = 0;
+const int UPDATE_INTERVAL = 5; // Actualización cada 5ms para suavidad
+
+// Variables para el antirrebote del botón
+bool lastButtonStableState = HIGH;
+bool lastButtonReading = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+
+// Variables para finales de carrera
+bool endStopActive = false;
+unsigned long endStopStartTime = 0;
+const unsigned long END_STOP_DELAY = 3000; // 3 segundos
+bool endStopDirection = true; // Dirección a la que irá tras la pausa
+bool waitingEndStopRelease = false; // Esperando a que se libere el final de carrera
+
+void setup() {
+  pinMode(IN1_PIN, OUTPUT);
+  pinMode(IN2_PIN, OUTPUT);
+  pinMode(IN1_PIN_2, OUTPUT);
+  pinMode(IN2_PIN_2, OUTPUT);
+  pinMode(SENSOR_LEFT, INPUT_PULLUP);
+  pinMode(SENSOR_RIGHT, INPUT_PULLUP);
+  pinMode(END_STOP_LEFT, INPUT_PULLUP);
+  pinMode(END_STOP_RIGHT, INPUT_PULLUP);
+  pinMode(SPEED_BUTTON_PIN, INPUT_PULLUP);
+
+  stopMotor();
+  stopSecondMotor();
+
+  Serial.begin(9600);
+  Serial.println("Sistema Pong iniciado");
+
+  delay(100);
+
+  waitingEndStopRelease = false;
+
+  // Comprobar finales de carrera al arrancar
+  bool endStopLeftActive = !digitalRead(END_STOP_LEFT);
+  bool endStopRightActive = !digitalRead(END_STOP_RIGHT);
+
+  if (endStopLeftActive || endStopRightActive) {
+    Serial.println("Final de carrera activado al arrancar - Iniciando pausa de 3 segundos");
+    endStopActive = true;
+    endStopStartTime = millis();
+    if (endStopRightActive) {
+      endStopDirection = false; // Ir hacia la izquierda después de la pausa
+      Serial.println("Final derecho activado - Después de pausa irá hacia la izquierda");
+    } else {
+      endStopDirection = true; // Ir hacia la derecha después de la pausa
+      Serial.println("Final izquierdo activado - Después de pausa irá hacia la derecha");
+    }
+    return;
+  }
+
+  // Comprobar sensores de cambio de dirección al arrancar (solo si no hay final de carrera)
+  bool leftSensorActive = !digitalRead(SENSOR_LEFT);
+  bool rightSensorActive = !digitalRead(SENSOR_RIGHT);
+
+  if (rightSensorActive) {
+    motorDirection = false;
+    Serial.println("Arranque: sensor derecho activado, arrancando hacia la izquierda");
+  } else if (leftSensorActive) {
+    motorDirection = true;
+    Serial.println("Arranque: sensor izquierdo activado, arrancando hacia la derecha");
+  } else {
+    motorDirection = true;
+    Serial.println("Arranque: ningún sensor activado, arrancando hacia la derecha");
+  }
+
+  // Arranque instantáneo
+  currentSpeed = MAX_SPEED;
+  targetSpeed = MAX_SPEED;
+  setMotorSpeed(currentSpeed, motorDirection); // Arrancar el motor principal
+  setSecondMotorSpeed(100);
+  Serial.println("Motores arrancados instantáneamente");
+}
+
+void loop() {
+  // Leer sensores de final de carrera
+  bool endStopLeftActive = !digitalRead(END_STOP_LEFT);
+  bool endStopRightActive = !digitalRead(END_STOP_RIGHT);
+
+  // Si estamos esperando a que se libere el final de carrera
+  if (waitingEndStopRelease) {
+    if (!endStopLeftActive && !endStopRightActive) {
+      waitingEndStopRelease = false;
+      Serial.println("Final de carrera liberado, sistema listo para detectar de nuevo.");
+    }
+    // No hacer return aquí - permitir que los motores sigan funcionando
+  }
+
+  // Si se activa un final de carrera y no estamos ya en pausa y no estamos esperando liberación
+  if ((endStopLeftActive || endStopRightActive) && !endStopActive && !waitingEndStopRelease) {
+    Serial.println("Final de carrera activado - Parando motores por 3 segundos");
+    endStopActive = true;
+    endStopStartTime = millis();
+    targetSpeed = 0;
+    stopSecondMotor();
+    if (endStopRightActive) {
+      endStopDirection = false; // Cambiar a izquierda después de la pausa
+      Serial.println("Final derecho - Después de pausa irá hacia la izquierda");
+    } else {
+      endStopDirection = true; // Cambiar a derecha después de la pausa
+      Serial.println("Final izquierdo - Después de pausa irá hacia la derecha");
+    }
+  }
+
+  // Si estamos en pausa por final de carrera
+  if (endStopActive) {
+    stopMotor();
+    stopSecondMotor();
+    if (millis() - endStopStartTime >= END_STOP_DELAY) {
+      // Han pasado 3 segundos, reanudar motores con arranque instantáneo
+      endStopActive = false;
+      waitingEndStopRelease = true; // Esperar a que se libere para evitar bucle
+      motorDirection = endStopDirection; // Cambiar dirección del principal
+      currentSpeed = MAX_SPEED;          // Arranque instantáneo
+      targetSpeed = MAX_SPEED;           // Mantener velocidad
+      setMotorSpeed(currentSpeed, motorDirection); // Arrancar el motor principal
+      setSecondMotorSpeed(100);           // El secundario siempre en el mismo sentido
+      Serial.println("Reanudando motores después de pausa - Arranque instantáneo");
+    } else {
+      return; // No hacer nada más durante la pausa
+    }
+  }
+
+  // Leer sensores de cambio de dirección (solo si no hay final de carrera activo)
+  bool leftSensorActive = !digitalRead(SENSOR_LEFT);
+  bool rightSensorActive = !digitalRead(SENSOR_RIGHT);
+
+  // Antirrebote botón velocidad
+  bool buttonReading = digitalRead(SPEED_BUTTON_PIN);
+  if (buttonReading != lastButtonReading) {
+    lastDebounceTime = millis();
+  }
+  lastButtonReading = buttonReading;
+
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (lastButtonStableState == HIGH && buttonReading == LOW) {
+      speedLevel = (speedLevel + 1) % 3;
+      MAX_SPEED = SPEED_LEVELS[speedLevel];
+      Serial.print("Nivel de velocidad cambiado a: ");
+      Serial.println(MAX_SPEED);
+      if (!pendingDirectionChange) {
+        // Cambio instantáneo de velocidad si no hay cambio de dirección pendiente
+        currentSpeed = MAX_SPEED;
+        targetSpeed = MAX_SPEED;
+        setMotorSpeed(currentSpeed, motorDirection); // Aplicar nueva velocidad
+      }
+    }
+    lastButtonStableState = buttonReading;
+  }
+
+  // Verificar sensores de cambio de dirección
+  if (leftSensorActive && motorDirection == false && !pendingDirectionChange) {
+    pendingDirectionChange = true;
+    newDirection = true;
+    targetSpeed = 0;
+    Serial.println("Sensor izquierdo activado - Iniciando frenado para cambiar a derecha");
+  }
+  else if (rightSensorActive && motorDirection == true && !pendingDirectionChange) {
+    pendingDirectionChange = true;
+    newDirection = false;
+    targetSpeed = 0;
+    Serial.println("Sensor derecho activado - Iniciando frenado para cambiar a izquierda");
+  }
+
+  if (millis() - lastUpdate >= UPDATE_INTERVAL) {
+    updateMotorSpeed();
+    lastUpdate = millis();
+  }
+}
+
+void updateMotorSpeed() {
+  if (currentSpeed != targetSpeed) {
+    if (currentSpeed > targetSpeed) {
+      // Solo frenado progresivo
+      int step = max(1, MAX_SPEED / BRAKE_STEPS);
+      currentSpeed -= step;
+      if (currentSpeed < targetSpeed) currentSpeed = targetSpeed;
+    }
+    else {
+      // Arranque instantáneo
+      currentSpeed = targetSpeed;
+    }
+
+    // Si hemos llegado a velocidad 0 y hay cambio de dirección pendiente
+    if (currentSpeed == 0 && pendingDirectionChange && !endStopActive) {
+      motorDirection = newDirection;
+      pendingDirectionChange = false;
+      delay(20);
+      currentSpeed = MAX_SPEED;  // Arranque instantáneo tras cambio de dirección
+      targetSpeed = MAX_SPEED;
+      Serial.println(motorDirection ? "Cambiando a derecha - Arranque instantáneo" : "Cambiando a izquierda - Arranque instantáneo");
+    }
+
+    setMotorSpeed(currentSpeed, motorDirection);
+  }
+}
+
+void setMotorSpeed(int speed, bool direction) {
+  if (speed == 0) {
+    stopMotor();
+  }
+  else if (direction) {
+    analogWrite(IN1_PIN, speed);
+    analogWrite(IN2_PIN, 0);
+  }
+  else {
+    analogWrite(IN1_PIN, 0);
+    analogWrite(IN2_PIN, speed);
+  }
+}
+
+void stopMotor() {
+  analogWrite(IN1_PIN, 0);
+  analogWrite(IN2_PIN, 0);
+}
+
+void setSecondMotorSpeed(int speed) {
+  if (speed == 0) {
+    stopSecondMotor();
+  } else {
+    analogWrite(IN1_PIN_2, speed);
+    analogWrite(IN2_PIN_2, 0);
+  }
+}
+
+void stopSecondMotor() {
+  analogWrite(IN1_PIN_2, 0);
+  analogWrite(IN2_PIN_2, 0);
+}
